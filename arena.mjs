@@ -147,7 +147,7 @@ export class ArenaEngine {
     this.profileDir = path.join(this.dataDir, 'chrome-profile');
     this.stateFile = path.join(this.dataDir, 'session.json');
     this.cdpPort = Number(opts.cdpPort || process.env.MAGPIE_ARENA_CDP_PORT || 9793);
-    this.keepAliveMinutes = Number(opts.keepAliveMinutes ?? 10);
+    this.keepAliveMinutes = Number(opts.keepAliveMinutes ?? 3);
     this.log = opts.log ?? (() => {});
     this.cdp = null;
     this.proc = null;
@@ -433,12 +433,114 @@ export class ArenaEngine {
     } catch { return null; }
   }
 
+  /** expiry (ms) of a raw cookie header string, or 0 when unreadable */
+  static expiryOfCookie(raw) {
+    if (!raw || typeof raw !== 'string') return 0;
+    try {
+      const sess = decodeSession(joinAuthCookie(parseCookieString(raw)));
+      return (sess?.expires_at || 0) * 1000;
+    } catch { return 0; }
+  }
+
+  /**
+   * If the state file holds a session that expires later than the one this
+   * browser currently has, load it. Every Magpie process shares that file, and
+   * only one of them can win a refresh_token rotation, so the losers must pick
+   * up the winner's result instead of spending their own dead token.
+   */
+  async _adoptNewerCookie() {
+    const disk = this.readState()?.cookie;
+    if (typeof disk !== 'string' || !disk) return false;
+    const diskExp = ArenaEngine.expiryOfCookie(disk);
+    if (!diskExp) return false;
+    const mine = await this.sessionInfo();
+    if (mine && diskExp <= mine.expiresAt + 60_000) return false;
+
+    const S = (m, p) => this.cdp.send(m, p, this.sessionId);
+    await this._injectCookie(S, disk);
+    await S('Page.reload', {}).catch(() => {});
+    await this._waitCf(S);
+    this.cookie = disk;
+    this.log('adopted a newer session from state (expires', new Date(diskExp).toISOString() + ')');
+    return true;
+  }
+
+  /**
+   * Cross-process renewal lock.
+   *
+   * arena hands out a fresh refresh_token per renewal and revokes the family if
+   * one is presented twice, so exactly one process may renew. The lock is a
+   * file created with O_EXCL; a lock older than two minutes is treated as
+   * abandoned, because a crashed process must not wedge every other one.
+   */
+  async _withRenewLock(fn) {
+    const lockFile = path.join(this.dataDir, 'renew.lock');
+    const STALE_MS = 120_000;
+    try { fs.mkdirSync(this.dataDir, { recursive: true }); } catch {}
+
+    const tryTake = () => {
+      try {
+        const st = fs.statSync(lockFile);
+        if (Date.now() - st.mtimeMs > STALE_MS) fs.rmSync(lockFile, { force: true });
+      } catch {}
+      try {
+        const fd = fs.openSync(lockFile, 'wx');
+        fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
+        fs.closeSync(fd);
+        return true;
+      } catch { return false; }
+    };
+
+    if (!tryTake()) {
+      this.log('renew: another process holds the lock, adopting its result instead');
+      // let the winner finish, then take whatever it wrote
+      for (let i = 0; i < 20; i++) {
+        await sleep(500);
+        if (await this._adoptNewerCookie().catch(() => false)) {
+          const now = await this.sessionInfo();
+          if (now && now.expiresAt - Date.now() > 30 * 60_000) return true;
+        }
+        if (tryTake()) break;
+      }
+      if (!fs.existsSync(lockFile)) return false;
+    }
+
+    try {
+      return await fn();
+    } finally {
+      try { fs.rmSync(lockFile, { force: true }); } catch {}
+    }
+  }
+
   /**
    * Renew without waiting for a 401: rewrite the cookie's expires_at into the
    * past, then call /api/me. arena's middleware then trades the refresh_token
    * for a new session and answers with new Set-Cookie headers.
    */
   async renew() {
+    const info = await this.sessionInfo();
+    if (!info) return false;
+
+    // arena rotates the refresh_token on every renewal, so a token can be spent
+    // exactly once. Magpie runs the gateway and each MCP server as separate
+    // processes, all pointing at this one state file; if this process holds a
+    // copy that another one already rotated, renewing would invalidate the
+    // session for everyone. Adopt the newer cookie first when the disk has one.
+    const adopted = await this._adoptNewerCookie().catch(() => false);
+    if (adopted) {
+      const fresh = await this.sessionInfo();
+      if (fresh && fresh.expiresAt - Date.now() > 30 * 60_000) {
+        this.log('renew skipped: another process already refreshed the session');
+        this.lastRenewAt = Date.now();
+        return true;
+      }
+    }
+
+    // only one process may spend a refresh_token at a time
+    return this._withRenewLock(() => this._renewLocked());
+  }
+
+  async _renewLocked() {
     const info = await this.sessionInfo();
     if (!info) return false;
 
@@ -501,6 +603,25 @@ export class ArenaEngine {
    * expired token, and it keeps a heartbeat file so a stuck timer is visible
    * instead of silently letting the session die.
    */
+  /**
+   * Keep the session alive without any user action.
+   *
+   * Two rules learned the hard way:
+   *
+   *   1. Renew as late and as rarely as possible. arena rotates the
+   *      refresh_token on every renewal and Supabase revokes the whole token
+   *      family when it sees one reused, so a speculative renewal can cost the
+   *      user their session. Wait until the access token is actually nearly
+   *      gone, and only then spend a refresh.
+   *   2. Never have two processes renew at once. Magpie runs the gateway and
+   *      every MCP server separately; they share one state file, and whoever
+   *      loses the race spends a dead token, which is what trips the reuse
+   *      detection above.
+   *
+   * The interval must stay well below the renewal threshold, or a tick can land
+   * after the token already expired and the short window gets skipped.
+   * Defaults: check every 3 minutes, renew under 12 minutes left.
+   */
   _startTimer() {
     if (this.timer) return;
     const tick = async () => {
@@ -511,23 +632,27 @@ export class ArenaEngine {
           this._reset();
           await this.ensure();
         }
-        // 2) token close to expiry? renew (renew() also writes the cookie back)
+        // 2) did another process already refresh it? adopt instead of renewing
+        await this._adoptNewerCookie().catch(() => false);
+
         const info = await this.sessionInfo();
-        const remainMin = info?.expiresAt ? Math.round((info.expiresAt - Date.now()) / 60000) : null;
+        if (!info) { this.log('keepalive: no session cookie readable'); return; }
+        const remainMin = Math.round((info.expiresAt - Date.now()) / 60000);
         this.log('keepalive: token remaining', remainMin, 'min');
-        if (remainMin === null || remainMin < 25) {
+        // shallow threshold on purpose: a renewal every few minutes is exactly
+        // how the token family gets revoked
+        if (remainMin < 12) {
           const ok = await this.renew();
           this.log('keepalive: renew ->', ok);
         }
-        if (!info) this.log('keepalive: no session cookie readable');
       } catch (e) {
         this.log('keepalive error:', e.message);
       }
     };
     this.timer = setInterval(tick, this.keepAliveMinutes * 60_000);
     this.timer.unref?.();
-    // run once soon after start, so a plugin that is only touched occasionally
-    // does not sit on an expiring token until the first interval elapses
+    // one early tick so a plugin that is only touched now and then does not
+    // carry an almost-dead token until the first full interval elapses
     const warm = setTimeout(() => { tick().catch(() => {}); }, 20_000);
     warm.unref?.();
   }

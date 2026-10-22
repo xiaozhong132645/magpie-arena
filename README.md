@@ -64,6 +64,20 @@ client hints 里仍会露出 headless 品牌）。
 
 ---
 
+### 会话保活
+
+插件自己续期，不需要你每天重新粘贴 cookie。它做四件事：
+
+- 每 3 分钟体检一次，剩余不足 12 分钟就续期
+- 浏览器挂了就重建，而不是干等着
+- 多个进程（网关 + 各 MCP server 共享一份 state）只有一个能续期，其余采纳它的结果
+- 启动时如果 access token 已过期，先用 refresh_token 救一次，再判定未登录
+
+**限制**：arena 的 refresh_token 一次性轮换，而且 Supabase 会检测复用并作废整个家族。
+所以如果所有进程都关着超过一小时，会话就会失效，只能重新登录。
+
+---
+
 ### 用参考图继续改
 
 `generate_image` 的 `reference_images` 接文件路径或 http(s) URL：
