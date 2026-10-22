@@ -7,7 +7,7 @@
 // plugin can do the browser dance arena.ai insists on (see arena.mjs) and answer
 // /v1/images/generations itself. ASCII only.
 
-import { ArenaEngine, parseCookieString, joinAuthCookie, decodeSession } from "./arena.mjs";
+import { ArenaEngine, parseCookieString, joinAuthCookie, decodeSession, guessMime } from "./arena.mjs";
 
 const ID = "arena";
 const VIRTUAL_API = "https://arena.invalid/v1";
@@ -151,6 +151,7 @@ export const ArenaPlugin = async (_input, options = {}) => {
               return json(400, { error: { message: String(e), type: "invalid_request_error" } });
             }
             const url = new URL(request.url);
+
             const path = url.pathname;
 
             try {
@@ -203,9 +204,72 @@ export const ArenaPlugin = async (_input, options = {}) => {
                 return json(200, { created: Math.floor(Date.now() / 1000), data });
               }
 
-              // ---- image edits: arena has no edit endpoint, say so plainly ----
-              if (request.method === "POST" && path === "/v1/images/edits") {
-                throw new PluginError(400, "unsupported_request", "arena.ai exposes no image edit endpoint; use /v1/images/generations.");
+              // ---- image edits: reference images become message attachments ----
+              if (request.method === "POST" && (path === "/v1/images/edits" || path === "/images/edits")) {
+                let form;
+                try {
+                  form = await request.formData();
+                } catch {
+                  throw new PluginError(
+                    400,
+                    "invalid_form",
+                    "Expected multipart/form-data with prompt and one or more image files.",
+                  );
+                }
+
+                const prompt = form.get("prompt");
+                if (!prompt || typeof prompt !== "string") {
+                  throw new PluginError(400, "prompt_required", "prompt is required");
+                }
+                const model = typeof form.get("model") === "string" ? form.get("model") : undefined;
+                const wantB64 = form.get("response_format") === "b64_json";
+
+                const files = [];
+                for (const [field, value] of form.entries()) {
+                  if (!value || typeof value === "string") continue;
+                  if (!/^image$|^image\[|^image_/i.test(field) && !/^image0?$/i.test(field)) continue;
+                  const blob = value;
+                  if (typeof blob.arrayBuffer !== "function") continue;
+                  const buf = Buffer.from(await blob.arrayBuffer());
+                  if (!buf.length) continue;
+                  files.push({
+                    buf,
+                    name: blob.name || `${field}.webp`,
+                    mimeType: blob.type || guessMime(blob.name || field),
+                  });
+                }
+
+                // tolerate the plain "image" field name used by OpenAI clients
+                if (!files.length) {
+                  for (const value of form.getAll("image")) {
+                    if (!value || typeof value === "string") continue;
+                    if (typeof value.arrayBuffer !== "function") continue;
+                    const buf = Buffer.from(await value.arrayBuffer());
+                    if (!buf.length) continue;
+                    files.push({ buf, name: value.name || "image.webp", mimeType: value.type || "image/webp" });
+                    break;
+                  }
+                }
+
+                if (!files.length) {
+                  throw new PluginError(
+                    400,
+                    "image_required",
+                    "No image found in the request. Send one or more files under the \"image\" or \"image[]\" fields.",
+                  );
+                }
+
+                const result = await engine.generate({
+                  prompt,
+                  model,
+                  referenceImages: files,
+                });
+                const data = [];
+                for (const img of result.images) {
+                  if (wantB64) data.push({ b64_json: await toB64(img.url) });
+                  else data.push({ url: img.url });
+                }
+                return json(200, { created: Math.floor(Date.now() / 1000), data });
               }
 
               // ---- a chat request for an image model: say exactly how to fix it ----

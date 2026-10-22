@@ -64,12 +64,34 @@ client hints 里仍会露出 headless 品牌）。
 
 ---
 
+### 用参考图继续改
+
+`generate_image` 的 `reference_images` 接文件路径或 http(s) URL：
+
+```
+generate_image(
+  prompt: "把苹果从红色改成蓝色，构图不变",
+  reference_images: ["assets/apple-red.png"],
+)
+```
+
+两个关键点：
+
+- **多轮迭代免费**：上一次结果图可以直接把它的 URL 塞回 `reference_images`，不用重新上传。
+- **本地文件也行**：插件会先传到你自己账号的 arena 存储，再作为参考图。
+
+40 个模型里 26 个支持图片输入，纯文生图的会回 400。
+
+---
+
 ## 它不是什么
 
 - **不是 API 逆向。** 它不伪造请求头、不破解 reCAPTCHA，就是用你自己的账号在浏览器里
   做你手动也能做的事。
 - **不是 arena.ai 官方产品**，与 arena.ai 无关。用的是**你自己**的账号和额度。
-- **只做文生图。** arena.ai 没有对外开放的图片编辑接口，`/v1/images/edits` 会明确返回不支持。
+- **参考图编辑支持 26/40 个模型。** `/v1/images/edits` 可用，本地图片会先上传到你自己
+  账号的 arena 存储再作为参考图；纯文生图的模型（`recraft-v4`、`photon`、`seedream-3` 等
+  14 个）不能改图，arena 会回 400。
 - 在 Magpie 里它是 **provider 插件**，不是代理服务。
 
 ## 使用前请知悉
@@ -289,7 +311,8 @@ magpie plugin rm arena                 # 卸载
 | `session_invalid` | cookie 里没有完整的 `arena-auth-prod-v1`，只复制了截断的一段 |
 | `images_endpoint_required` | **agent 被选成了 arena 模型**。把 agent 主模型换回文字模型，改用 `generate_image` 工具，见 [上面](#最重要的一件事不要把-arena-模型选成-agent-的聊天模型) |
 | `prompt is too long: about N tokens, more than ... context window` | 同一个原因：用生图模型跑了一阵对话，上下文撑爆了。换回文字模型 |
-| `unsupported_request` | 调了 `/v1/images/edits`，arena 没有图片编辑接口 |
+| `Model does not support file input` | 参考图给了不支持图片输入的模型。换 `gpt-image-2.5-sunburst` / `seedream-5.0-pro` / `gemini-*-image` 等 26 个支持的 |
+| `arena_upload_failed: generateUploadUrl` | arena 前端重新部署，Server Action id 变了。见 [docs/arena-upload-chain.md](docs/arena-upload-chain.md) |
 | `429 prompt failed` | 限流，见上 |
 | `403 recaptcha validation failed` | 风控，见上 |
 | agent 里没有 `generate_image` 工具 | `magpie library mcp agents magpie-image <agent>` 再 `magpie library sync` |

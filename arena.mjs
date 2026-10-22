@@ -26,6 +26,21 @@ const SITE_KEY = '6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0';
 const ACTION = 'chat_submit';
 const AUTH_BASE = 'arena-auth-prod-v1';
 
+// React Server Action ids for arena's message attachment storage. They are baked
+// into the current deployment's client bundle, so a redeploy can rotate them;
+// uploadImage() reports a clear error if that happens.
+const GEN_ACTION = '704145b69989c6b49d880846a53651e6fbab687a67';
+const SIGN_ACTION = '605d54c9cd73310ba84031b0fdffb9cf60aadb05c0';
+
+export const guessMime = (name) => {
+  const ext = String(name).toLowerCase().split('.').pop();
+  if (ext === 'png') return 'image/png';
+  if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
+  if (ext === 'webp') return 'image/webp';
+  if (ext === 'gif') return 'image/gif';
+  return 'image/webp';
+};
+
 // Headless Chrome advertises itself in the user agent, and reCAPTCHA Enterprise
 // scores that as a low-trust client. Every request that reaches arena should look
 // like ordinary desktop Chrome, which is also what the account's real browser is.
@@ -295,6 +310,17 @@ export class ArenaEngine {
       await this._waitCf(S);
       me = await this._checkMe(S);
     }
+    // A stale access token is recoverable: the injected cookie still holds a
+    // refresh_token, and punching expires_at into the past makes arena's
+    // middleware trade it for a fresh session. Try that before giving up, or an
+    // idle plugin dies every hour and needs the user to paste a cookie again.
+    if (!me.email) {
+      this.log('not logged in after inject; trying a refresh_token renewal');
+      if (await this.renew().catch(() => false)) {
+        me = await this._checkMe(S);
+        this.log('renewal restored the session');
+      }
+    }
     if (!me.email) throw new Error('not logged in: paste a fresh arena.ai cookie in Magpie');
     this.log('logged in as', me.email);
     await this._ensureRecaptcha(S);
@@ -321,6 +347,13 @@ export class ArenaEngine {
       await S('Page.reload', {});
       await this._waitCf(S);
       me = await this._checkMe(S);
+    }
+    if (!me.email) {
+      this.log('not logged in after reattach; trying a refresh_token renewal');
+      if (await this.renew().catch(() => false)) {
+        me = await this._checkMe(S);
+        this.log('renewal restored the session');
+      }
     }
     if (!me.email) throw new Error('not logged in: paste a fresh arena.ai cookie in Magpie');
     await this._ensureRecaptcha(S);
@@ -460,17 +493,43 @@ export class ArenaEngine {
     return false;
   }
 
+  /**
+   * Keep the session alive without any user action.
+   *
+   * The timer must never "return early and do nothing": an idle plugin is exactly
+   * the case it exists for. It rebuilds a dead browser and renews a nearly
+   * expired token, and it keeps a heartbeat file so a stuck timer is visible
+   * instead of silently letting the session die.
+   */
   _startTimer() {
     if (this.timer) return;
-    this.timer = setInterval(async () => {
+    const tick = async () => {
       try {
-        if (!this.ready || !(await this.cdp?.alive?.())) return;
+        // 1) browser gone? rebuild it, cookies are on disk
+        if (!this.ready || !this.sessionId || !(await this.cdp?.alive?.())) {
+          this.log('keepalive: browser gone, rebuilding');
+          this._reset();
+          await this.ensure();
+        }
+        // 2) token close to expiry? renew (renew() also writes the cookie back)
         const info = await this.sessionInfo();
         const remainMin = info?.expiresAt ? Math.round((info.expiresAt - Date.now()) / 60000) : null;
-        if (remainMin === null || remainMin < 25) await this.renew();
-      } catch (e) { this.log('keepalive error:', e.message); }
-    }, this.keepAliveMinutes * 60_000);
+        this.log('keepalive: token remaining', remainMin, 'min');
+        if (remainMin === null || remainMin < 25) {
+          const ok = await this.renew();
+          this.log('keepalive: renew ->', ok);
+        }
+        if (!info) this.log('keepalive: no session cookie readable');
+      } catch (e) {
+        this.log('keepalive error:', e.message);
+      }
+    };
+    this.timer = setInterval(tick, this.keepAliveMinutes * 60_000);
     this.timer.unref?.();
+    // run once soon after start, so a plugin that is only touched occasionally
+    // does not sit on an expiring token until the first interval elapses
+    const warm = setTimeout(() => { tick().catch(() => {}); }, 20_000);
+    warm.unref?.();
   }
 
   dispose() {
@@ -527,19 +586,102 @@ export class ArenaEngine {
   }
 
   // ---------- generation ----------
-  async generate({ prompt, model, timeoutMs = 280000 }) {
+  /**
+   * Upload one image to arena's message storage and return a signed URL that
+   * create-evaluation accepts as experimental_attachments[].url.
+   *
+   * The browser talks to two React Server Actions for this, so the request has
+   * to be shaped the way the RSC client shapes it:
+   *
+   *   POST <current page>   Next-Action: <action id>
+   *   form field "0" = JSON array of the action arguments
+   *
+   * Anything else (plain JSON body, one field per argument) makes the action
+   * run with no arguments and answer {"success":false,"error":"Failed to
+   * generate upload url"} - a dead end that looks like a backend error.
+   *
+   * Flow: generateUploadUrl(name, type) -> PUT bytes to the presigned r2 URL ->
+   * getSignedUrl(key) -> a URL with X-Amz-Signature that arena can read back.
+   */
+  async uploadImage(buf, name, mimeType) {
+    await this.ensure();
+    const S = (m, p) => this.cdp.send(m, p, this.sessionId);
+    const fileName = String(name || 'image.webp');
+    const type = String(mimeType || 'image/webp');
+    const b64 = Buffer.from(buf).toString('base64');
+    const site = 'https://arena.ai';
+
+    const expr = `(async () => {
+      const call = async (actionId, args) => {
+        const fd = new FormData();
+        fd.append('0', JSON.stringify(args));
+        const r = await fetch(location.href, {
+          method: 'POST', headers: { 'Next-Action': actionId }, body: fd,
+        });
+        const t = await r.text();
+        const m = t.match(/\\{"success":[\\s\\S]*?\\}\\}/);
+        if (!m) return { ok: false, err: 'no result in ' + r.status + ' ' + t.slice(0, 200) };
+        try { return JSON.parse(m[0]); } catch (e) { return { ok: false, err: 'bad json' }; }
+      };
+
+      const gen = await call('${GEN_ACTION}', [${JSON.stringify(fileName)}, ${JSON.stringify(type)}]);
+      if (!gen.success || !gen.data) return JSON.stringify({ err: 'generateUploadUrl: ' + (gen.error || 'no data') });
+
+      const bin = Uint8Array.from(atob(${JSON.stringify(b64)}), (c) => c.charCodeAt(0));
+      const put = await fetch(gen.data.uploadUrl, {
+        method: 'PUT', body: bin, headers: { 'Content-Type': ${JSON.stringify(type)} },
+      });
+      if (!put.ok) return JSON.stringify({ err: 'upload PUT failed: ' + put.status });
+
+      const sign = await call('${SIGN_ACTION}', [gen.data.key]);
+      if (!sign.success || !sign.data) return JSON.stringify({ err: 'getSignedUrl: ' + (sign.error || 'no data') });
+      return JSON.stringify({ url: sign.data.url, key: gen.data.key });
+    })()`;
+
+    const out = await S('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true });
+    let j = null;
+    try { j = JSON.parse(out.result?.value ?? '{}'); } catch {}
+    if (!j?.url) {
+      throw Object.assign(new Error(`cannot upload reference image to arena: ${j?.err || 'unknown error'}`), {
+        status: 502,
+        code: 'arena_upload_failed',
+      });
+    }
+    return j;
+  }
+
+  async generate({ prompt, model, timeoutMs = 280000, referenceImages = [] }) {
     await this.ensure();
     const run = async () => {
       // the plugin process can be short lived, so renewing must not rely on the timer
       await this.ensureFresh().catch(() => {});
-      return this._generateOnce({ prompt, model, timeoutMs });
+
+      // reference images become message attachments. Accept either already-signed
+      // URLs (arena's own storage, e.g. a previous result) or raw bytes to upload.
+      const attachments = [];
+      for (const ref of referenceImages) {
+        if (!ref) continue;
+        if (typeof ref === 'string' && /^https:\/\//i.test(ref)) {
+          const guessed = ref.split('?')[0].split('/').pop() || 'reference.webp';
+          attachments.push({ name: guessed, contentType: guessMime(guessed), url: ref });
+        } else if (ref && ref.buf) {
+          const up = await this.uploadImage(ref.buf, ref.name, ref.mimeType);
+          attachments.push({
+            name: ref.name || 'reference.webp',
+            contentType: ref.mimeType || 'image/webp',
+            url: up.url,
+          });
+        }
+      }
+
+      return this._generateOnce({ prompt, model, timeoutMs, attachments });
     };
     const p = this.queue.then(run, run);
     this.queue = p.then(() => {}, () => {});
     return p;
   }
 
-  async _generateOnce({ prompt, model, timeoutMs }) {
+  async _generateOnce({ prompt, model, timeoutMs, attachments = [] }) {
     const models = await this.listModels();
     const target = this.resolveModel(models, model) || models[0];
     const S = (m, p) => this.cdp.send(m, p, this.sessionId);
@@ -568,7 +710,7 @@ export class ArenaEngine {
         id: uuidv7(), mode: 'battle',
         modelAId: ${JSON.stringify(target.id)}, modelBId: ${JSON.stringify(target.id)},
         userMessageId: uuidv7(), modelAMessageId: uuidv7(), modelBMessageId: uuidv7(),
-        userMessage: { content: ${JSON.stringify(prompt)}, experimental_attachments: [], metadata: {} },
+        userMessage: { content: ${JSON.stringify(prompt)}, experimental_attachments: ${JSON.stringify(attachments)}, metadata: {} },
         modality: 'image', recaptchaV3Token: token,
       };
       const r = await fetch('/nextjs-api/stream/create-evaluation', {

@@ -11,15 +11,17 @@ session.json
 *.png
 *.jpg
 .samples/
+generated-images/
 
-# scratch
+# local diagnostics
+_probe*.mjs
+_instrument*.mjs
+.cookie-new.txt
+.cache-*.bin
+.cache-*.log
 .commit-msg.txt
 
 node_modules/
 npm-debug.log*
 .DS_Store
 Thumbs.db
-
-# local diagnostics
-_probe*.mjs
-.cookie-new.txt
