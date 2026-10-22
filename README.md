@@ -1,0 +1,248 @@
+# magpie-arena
+
+**arena.ai 的 40 个文生图模型，接进 Magpie。**
+
+装上、登录一次你的 arena.ai 账号，`arena/gpt-image-2.5-sunburst`、`arena/seedream-5.0-pro`、
+`arena/flux-3-image` 这些模型就和别的 provider 一样出现在 Magpie 里 —— AI agent 的
+`generate_image` 工具可以直接用，网关的 `/v1/images/generations` 也可以直接调。
+
+这是一个 [Magpie](https://usemagpie.ai) 的 **provider 插件**（Magpie 的 provider 插件与
+OpenCode 插件同构），不是独立服务：不需要常驻进程，不需要额外端口。
+
+> **English:** A Magpie / OpenCode provider plugin that exposes arena.ai's 40 text-to-image
+> models so your agents can draw. It does not call an API — arena.ai binds its reCAPTCHA token
+> to the browser fingerprint, so this drives a real Chrome and generates inside the page
+> (see [Why it opens a browser](#为什么它要开一个浏览器)).
+
+---
+
+## 为什么它要开一个浏览器
+
+arena.ai 用 reCAPTCHA v3 保护生图接口，而 **token 与浏览器指纹和 cookie jar 绑定**。
+外部 HTTP 客户端（curl、requests、impit、headless 浏览器）即使拿到一个刚 mint 出来的
+有效 token 去 POST，也会被拒：
+
+```
+403 {"error":"recaptcha validation failed"}
+```
+
+唯一能跑通的形态是「在同一个已登录页面上下文里取 token → 立刻 fetch」。所以这个插件不
+模拟 API，它用 CDP 驱动一个真实的（非 headless）Chrome，在页面里完成整条链路：
+
+```
+你的 agent / Magpie 网关
+        │  arena/<model>
+        ▼
+插件 fetch  ──►  CDP  ──►  真实 Chrome（插件自己的 profile）
+                              │  页面内 mint grecaptcha token
+                              │  POST /nextjs-api/stream/create-evaluation
+                              ▼  SSE 返回图片地址 → 下载 → url / b64
+```
+
+那个 Chrome 由插件自己管理，profile 单独存放，不会碰你日常用的浏览器；关掉后下次请求
+会自动重建。
+
+---
+
+## 它不是什么
+
+- **不是 API 逆向。** 它不伪造请求头、不破解 reCAPTCHA，就是用你自己的账号在浏览器里
+  做你手动也能做的事。
+- **不是 arena.ai 官方产品**，与 arena.ai 无关。用的是**你自己**的账号和额度。
+- **只做文生图。** arena.ai 没有对外开放的图片编辑接口，`/v1/images/edits` 会明确返回不支持。
+- 在 Magpie 里它是 **provider 插件**，不是代理服务。
+
+## 使用前请知悉
+
+- 自动化访问可能不符合 arena.ai 的服务条款，**账号风险由你承担**。
+- arena 对账号有生图速率限制。超了返回 `429 {"error":"prompt failed"}`（文案很坑，不是
+  提示词问题）；密集请求后还会升级成 `403 recaptcha validation failed`，那是账号级风控
+  评分下降，只能等它恢复。详见 [限流](#限流)。
+- 登录凭证（cookie）等于账号权限。插件把它存在本机 `~/.magpie-arena/session.json`
+  （权限 `0600` 尽力而为），**不要提交进 git，不要贴给别人**。
+
+---
+
+## 安装
+
+```bash
+magpie plugin add github:xiaozhong132645/magpie-arena
+```
+
+或本地克隆后：
+
+```bash
+git clone https://github.com/xiaozhong132645/magpie-arena.git
+magpie plugin add ./magpie-arena
+```
+
+装完 `magpie plugin` 会看到：
+
+```
+github:xiaozhong132645/magpie-arena  on
+  arena (Arena.ai, 40 models)  not signed in · magpie plugin login arena
+```
+
+## 登录
+
+`magpie plugin login` 从 **stdin** 读凭证，不接受命令行参数。
+
+**1. 取 cookie**：Chrome 打开 `https://arena.ai/image`（确认已登录）→ `F12` → Network →
+刷新 → 点任意发往 `arena.ai` 的请求 → Request Headers 里 `cookie:` 的整行值复制。
+只要包含完整的 `arena-auth-prod-v1`（分片 `.0` / `.1`）即可，缺了会报 `session_invalid`。
+
+**2. 喂给 Magpie**：
+
+```bash
+# macOS / Linux
+pbpaste | magpie plugin login arena
+
+# Windows PowerShell
+Get-Clipboard | magpie plugin login arena
+
+# 或者从文件
+magpie plugin login arena < cookie.txt
+```
+
+成功后会提示 `✓ signed in to Arena.ai · its models are arena/<model>`。
+
+## 用
+
+**让 Magpie 的 `generate_image` 用 arena 的模型**（不设的话自动挑到的可能是别的 provider
+的画图模型），编辑 `~/.config/magpie/settings.json`：
+
+```json
+{ "imageGen": "arena/gpt-image-2.5-sunburst" }
+```
+
+**网关直接调**（`model` 用 `arena/<名字>`）：
+
+```bash
+curl -X POST http://127.0.0.1:3425/v1/images/generations \
+  -H "content-type: application/json" \
+  -d '{"model":"arena/gpt-image-2.5-sunburst","prompt":"a red apple on a wooden table","response_format":"url"}'
+```
+
+`response_format`：`url`（默认，省流量）或 `b64_json`（直接给字节）。
+
+**模型名从哪来**：
+
+```bash
+magpie provider arena          # 列出 arena 的模型与已暴露的子集
+magpie models | grep arena     # 看 Magpie 给 agent 的列表
+```
+
+默认只暴露 40 个里的一部分。想换：
+
+```bash
+magpie provider models arena --all                 # 全部 40 个
+magpie provider models arena +qwen-image-2.0       # 加一个
+magpie provider models arena gpt-image-2.5-sunburst seedream-5.0-pro   # 只留这两个
+```
+
+---
+
+## 保活（会话续期）
+
+arena 的 access token 只有 1 小时有效期。插件三层保活，**不需要你手动维护**：
+
+| 层 | 做什么 | 时机 |
+|---|---|---|
+| 主动续期 | 把 cookie 的 `expires_at` 改成过去 → 请求 `/api/me` → arena 的 Next.js 中间件发现会话过期，用 `refresh_token` 换新会话并下发新 cookie | 每次生图前检查，剩余 < 15 分钟就续期；另有 10 分钟定时器 |
+| cookie 落盘 | 续期后把浏览器最新 cookie 写进 `~/.magpie-arena/session.json`；下次注入时取「更晚过期」的那份 | 续期后 / 登录后 |
+| 浏览器重建 | `Browser.getVersion` 4 秒探活；Chrome 被关掉就重新拉起并沿用 profile 里的登录态 | 每次请求前 |
+
+续期失败会**回滚**：先快照当前 cookie 分片，续期后仍未登录就把旧分片写回复验，
+避免一次服务端抖动把可用会话搞丢。
+
+**保活救不了的情况**：arena 主动让 refresh_token 失效（登出、改密码、长期不用、账号被清）。
+这时接口会返回 `401 session_required` / `session_invalid`，重新跑一次
+`magpie plugin login arena` 即可。
+
+---
+
+## 限流
+
+arena 对账号有生图速率限制。超了它回的是 `429 {"error":"prompt failed"}` —— 文案很坑，
+看起来像提示词问题，实际是限流。插件已经识别并翻译成：
+
+```json
+{"error":{"message":"arena.ai rate limited this account (429 \"prompt failed\"): too many image generations, try again later",
+          "type":"arena_error","code":"arena_rate_limited"}}
+```
+
+带 `retry-after: 120`。等几分钟再试，不需要改提示词。
+
+### 再往上就是 reCAPTCHA 风控
+
+短时间内打太多之后，arena 会从 429 升级成：
+
+```json
+{"error":"recaptcha validation failed"}   // 403
+```
+
+这**不是** cookie 失效、也不是插件坏了。已验证的判断依据：
+
+- `/api/me` 仍然是 200，登录态正常
+- 页面里 `grecaptcha.enterprise.execute()` 仍能 mint 出 token
+- 换一个全新的 Chrome profile、或换回有长期浏览历史的旧 profile，一样 403
+- 成功出图与失败的那些请求，形状完全一致
+
+结论：这是**账号 / IP 级别的 reCAPTCHA 评分被打下去**，只能等它自己恢复，越试越久。
+观测顺序是 `429 prompt failed` → 若干分钟后 `403 recaptcha validation failed`，
+恢复时间不确定（实测 25 分钟未恢复），建议停手数小时。
+
+三种状态速查：
+
+```bash
+curl -s http://127.0.0.1:3425/v1/images/generations \
+  -H "content-type: application/json" \
+  -d '{"model":"arena/gpt-image-2.5-sunburst","prompt":"a lighthouse at dusk"}'
+# 200                              -> 正常
+# 429 arena_rate_limited           -> 限流，等几分钟
+# 403 recaptcha validation failed  -> 风控，停手几小时
+```
+
+---
+
+## 文件与状态
+
+| 文件 | 作用 |
+|---|---|
+| `index.mjs` | 插件入口：`config` / `auth`（cookie）/ `provider.models` / `fetch` 实现 |
+| `arena.mjs` | 引擎：Chrome + CDP、mint token、调 create-evaluation、解析 SSE、模型目录、续期 |
+| `package.json` | 元数据 + `magpie.icon` |
+
+运行时状态在 `~/.magpie-arena/`：
+
+- `chrome-profile/` — 插件专用 Chrome profile（**不要指向你日常用的 profile**）
+- `session.json` — 最近一次续期后的 cookie（**密钥，勿外传**）
+
+## 排障
+
+```bash
+magpie plugin                          # 是否 on、是否 signed in、模型数
+magpie models | grep arena             # 模型是否进了 Magpie 列表
+magpie plugin rm arena                 # 卸载
+```
+
+| 现象 | 原因 |
+|---|---|
+| 模型数只有 1 个 | 没登录，或 arena 拉模型失败。先 `magpie plugin login arena` |
+| `session_invalid` | cookie 里没有完整的 `arena-auth-prod-v1`，只复制了截断的一段 |
+| `images_endpoint_required` | 用 `/v1/chat/completions` 调了图片模型，改用 `/v1/images/generations` |
+| `unsupported_request` | 调了 `/v1/images/edits`，arena 没有图片编辑接口 |
+| `429 prompt failed` | 限流，见上 |
+| `403 recaptcha validation failed` | 风控，见上 |
+| Chrome 起不来 | 确认 `CHROME_CANDIDATES`（`arena.mjs` 顶部）里有你的 Chrome 路径 |
+
+**Chrome 路径**默认按顺序探测 Windows / macOS / Linux 的常见位置。如果都不中，
+改 `arena.mjs` 顶部的 `CHROME_CANDIDATES`，或把 `chrome` 放进 `PATH`。
+
+**CDP 端口**默认 `9793`，被占用时设环境变量 `MAGPIE_ARENA_CDP_PORT`。
+
+---
+
+## License
+
+MIT。与 arena.ai 无关，使用者自行承担账号合规与风险。

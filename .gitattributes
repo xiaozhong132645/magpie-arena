@@ -1,0 +1,6 @@
+# normalize line endings so the repo stays LF on every platform
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.webp binary
+*.png binary
+*.jpg binary

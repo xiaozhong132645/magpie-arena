@@ -1,0 +1,18 @@
+# runtime state written by the plugin: renewed cookies and the Chrome profile
+.magpie-arena/
+
+# never commit credentials
+.secrets/
+cookie.txt
+session.json
+
+# generated samples / scratch output
+*.webp
+*.png
+*.jpg
+.samples/
+
+node_modules/
+npm-debug.log*
+.DS_Store
+Thumbs.db

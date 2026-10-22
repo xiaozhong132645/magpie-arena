@@ -1,0 +1,45 @@
+{
+  "name": "magpie-arena",
+  "version": "1.0.0",
+  "description": "Magpie / OpenCode provider plugin for arena.ai text-to-image (40 models). Drives a real Chrome over CDP, because arena's reCAPTCHA is fingerprint-bound.",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "license": "MIT",
+  "files": [
+    "index.mjs",
+    "arena.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "opencode",
+    "opencode-plugin",
+    "arena",
+    "arena-ai",
+    "text-to-image",
+    "image-generation",
+    "ai-art",
+    "cdp",
+    "chrome-devtools-protocol",
+    "gpt-image",
+    "seedream",
+    "flux"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiaozhong132645/magpie-arena.git"
+  },
+  "homepage": "https://github.com/xiaozhong132645/magpie-arena#readme",
+  "bugs": {
+    "url": "https://github.com/xiaozhong132645/magpie-arena/issues"
+  },
+  "magpie": {
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHRleHQgeT0iMTgiIGZvbnQtc2l6ZT0iMTgiPkE8L3RleHQ+PC9zdmc+"
+  }
+}
