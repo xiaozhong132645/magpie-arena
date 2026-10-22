@@ -12,6 +12,9 @@ session.json
 *.jpg
 .samples/
 
+# scratch
+.commit-msg.txt
+
 node_modules/
 npm-debug.log*
 .DS_Store

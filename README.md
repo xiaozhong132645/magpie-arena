@@ -108,11 +108,48 @@ magpie plugin login arena < cookie.txt
 
 ## 用
 
-**让 Magpie 的 `generate_image` 用 arena 的模型**（不设的话自动挑到的可能是别的 provider
-的画图模型），编辑 `~/.config/magpie/settings.json`：
+### 最重要的一件事：不要把 arena 模型选成 agent 的聊天模型
+
+arena 的模型**只画图，不能聊天**。如果你在 Codex / Claude Code / OpenCode 的模型选择器里
+把主模型选成了 `arena/...`，那个 agent 就废了 —— 它的每一句对话都会变成一次
+`chat/completions`，而这个插件没有聊天能力：
+
+```
+Arena.ai: arena models draw images; they are not chat models.
+This request came in as a chat completion, which usually means an agent
+was switched to an arena model by mistake.
+Fix: pick a text model for the agent, and let the agent draw by calling
+Magpie's generate_image tool.
+```
+
+**正确姿势**是两步：
+
+1. agent 的主模型是**文字模型**（DeepSeek / GLM / Claude …）
+2. 让它画图时调 **`generate_image` 工具**（Magpie 的 image MCP），底层用哪个 arena 模型由
+   `settings.json` 的 `imageGen` 决定
+
+想从根上避免这种误选，让 arena 模型不进 agent 的模型列表：
+
+```bash
+magpie provider listed arena no      # arena 只通过路由组可用，不列进 agent 选择器
+magpie provider listed arena yes     # 改回来
+```
+
+### 配好 generate_image 用哪个 arena 模型
+
+编辑 `~/.config/magpie/settings.json`：
 
 ```json
 { "imageGen": "arena/gpt-image-2.5-sunburst" }
+```
+
+不设的话，Magpie 自动挑到的可能是别的 provider 的画图模型（比如 ChatGPT 那个，会 403）。
+
+还要把这个 MCP 派给要用它的 agent（不派的话 agent 根本看不见 `generate_image`）：
+
+```bash
+magpie library mcp agents magpie-image codex     # 派给 codex（可逗号分隔多个）
+magpie library sync
 ```
 
 **网关直接调**（`model` 用 `arena/<名字>`）：
@@ -230,10 +267,12 @@ magpie plugin rm arena                 # 卸载
 |---|---|
 | 模型数只有 1 个 | 没登录，或 arena 拉模型失败。先 `magpie plugin login arena` |
 | `session_invalid` | cookie 里没有完整的 `arena-auth-prod-v1`，只复制了截断的一段 |
-| `images_endpoint_required` | 用 `/v1/chat/completions` 调了图片模型，改用 `/v1/images/generations` |
+| `images_endpoint_required` | **agent 被选成了 arena 模型**。把 agent 主模型换回文字模型，改用 `generate_image` 工具，见 [上面](#最重要的一件事不要把-arena-模型选成-agent-的聊天模型) |
+| `prompt is too long: about N tokens, more than ... context window` | 同一个原因：用生图模型跑了一阵对话，上下文撑爆了。换回文字模型 |
 | `unsupported_request` | 调了 `/v1/images/edits`，arena 没有图片编辑接口 |
 | `429 prompt failed` | 限流，见上 |
 | `403 recaptcha validation failed` | 风控，见上 |
+| agent 里没有 `generate_image` 工具 | `magpie library mcp agents magpie-image <agent>` 再 `magpie library sync` |
 | Chrome 起不来 | 确认 `CHROME_CANDIDATES`（`arena.mjs` 顶部）里有你的 Chrome 路径 |
 
 **Chrome 路径**默认按顺序探测 Windows / macOS / Linux 的常见位置。如果都不中，

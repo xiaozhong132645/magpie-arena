@@ -62,7 +62,11 @@ function modelEntry(model) {
     status: "active",
     options: {},
     headers: {},
-    limit: { context: 8192, output: 8192 },
+    // An image model has no conversation window. Left small, Magpie rejects a
+    // long chat request locally with a confusing "prompt is too long" before it
+    // ever reaches us, hiding the real problem (an agent was pointed at an image
+    // model). Keeping it generous lets our explanatory error through instead.
+    limit: { context: 1000000, output: 8192 },
     capabilities: {
       temperature: false,
       reasoning: false,
@@ -182,12 +186,17 @@ export const ArenaPlugin = async (_input, options = {}) => {
                 throw new PluginError(400, "unsupported_request", "arena.ai exposes no image edit endpoint; use /v1/images/generations.");
               }
 
-              // ---- a chat request for an image model: tell the caller where to go ----
+              // ---- a chat request for an image model: say exactly how to fix it ----
               if (request.method === "POST" && (path === "/v1/chat/completions" || path === "/chat/completions")) {
                 throw new PluginError(
                   400,
                   "images_endpoint_required",
-                  "These models draw images: call /v1/images/generations (or Magpie's generate_image tool), not chat completions.",
+                  "arena models draw images; they are not chat models. This request came in as a chat completion, " +
+                  "which usually means an agent was switched to an arena model by mistake. Fix: pick a text model " +
+                  "for the agent (magpie <agent> <provider>/<chat-model>), and let the agent draw by calling " +
+                  "Magpie's generate_image tool; set settings.json \"imageGen\": \"arena/<model>\" to choose which " +
+                  "arena model that tool uses. To hide arena models from the agent's model list entirely, run " +
+                  "magpie provider listed arena no.",
                 );
               }
 

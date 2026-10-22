@@ -1,6 +1,6 @@
 {
   "name": "magpie-arena",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Magpie / OpenCode provider plugin for arena.ai text-to-image (40 models). Drives a real Chrome over CDP, because arena's reCAPTCHA is fingerprint-bound.",
   "type": "module",
   "main": "./index.mjs",
