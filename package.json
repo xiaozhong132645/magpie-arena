@@ -5,7 +5,7 @@
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "files": [
     "index.mjs",
     "arena.mjs",

@@ -245,4 +245,4 @@ magpie plugin rm arena                 # 卸载
 
 ## License
 
-MIT。与 arena.ai 无关，使用者自行承担账号合规与风险。
+Apache License 2.0。本项目与 arena.ai 无关，使用者自行承担账号合规与风险。
