@@ -19,3 +19,7 @@ node_modules/
 npm-debug.log*
 .DS_Store
 Thumbs.db
+
+# local diagnostics
+_probe*.mjs
+.cookie-new.txt

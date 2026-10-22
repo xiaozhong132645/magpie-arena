@@ -157,6 +157,28 @@ export const ArenaPlugin = async (_input, options = {}) => {
               const cookie = cookieFromAuth(await getAuth());
               const engine = engineFor(cookie);
 
+              // ---- anything but a chat misuse: make sure the session is alive first ----
+              if (request.method === "POST") {
+                try {
+                  await engine.ensure();
+                } catch (startError) {
+                  // a stale profile can sit on an expired cookie; one forced renew
+                  // (then a rebuild) before giving up
+                  let recovered = false;
+                  try {
+                    recovered = await engine.renew();
+                  } catch { /* fall through to a rebuild */ }
+                  if (!recovered) {
+                    engine._reset();
+                    try {
+                      await engine.ensure();
+                      recovered = true;
+                    } catch { /* report the original reason below */ }
+                  }
+                  if (!recovered) throw startError;
+                }
+              }
+
               // ---- image generation ----
               if (request.method === "POST" && (path === "/v1/images/generations" || path === "/images/generations")) {
                 let body;
