@@ -19,28 +19,48 @@ OpenCode 插件同构），不是独立服务：不需要常驻进程，不需�
 ## 为什么它要开一个浏览器
 
 arena.ai 用 reCAPTCHA v3 保护生图接口，而 **token 与浏览器指纹和 cookie jar 绑定**。
-外部 HTTP 客户端（curl、requests、impit、headless 浏览器）即使拿到一个刚 mint 出来的
-有效 token 去 POST，也会被拒：
+外部 HTTP 客户端（curl、requests、impit）即使拿到一个刚 mint 出来的有效 token 去 POST，
+也会被拒：
 
 ```
 403 {"error":"recaptcha validation failed"}
 ```
 
 唯一能跑通的形态是「在同一个已登录页面上下文里取 token → 立刻 fetch」。所以这个插件不
-模拟 API，它用 CDP 驱动一个真实的（非 headless）Chrome，在页面里完成整条链路：
+模拟 API，它用 CDP 驱动一个 Chrome，在页面里完成整条链路：
 
 ```
 你的 agent / Magpie 网关
         │  arena/<model>
         ▼
-插件 fetch  ──►  CDP  ──►  真实 Chrome（插件自己的 profile）
+插件 fetch  ──►  CDP  ──►  Chrome（插件自己的 profile，无窗口）
                               │  页面内 mint grecaptcha token
                               │  POST /nextjs-api/stream/create-evaluation
                               ▼  SSE 返回图片地址 → 下载 → url / b64
 ```
 
-那个 Chrome 由插件自己管理，profile 单独存放，不会碰你日常用的浏览器；关掉后下次请求
-会自动重建。
+那个浏览器由插件自己管理，profile 单独存放，不会碰你日常用的浏览器；关掉后下次请求
+会自动重建。它跑在 **headless 模式，所以你的桌面上不会出现任何窗口**。
+
+### 一个坑：headless 的 UA 必须改掉
+
+headless Chrome 会在 User-Agent 里报 `HeadlessChrome/...`，reCAPTCHA Enterprise 把它判为
+低信任客户端，于是 token 照常 mint 出来、POST 却永远 403。用 REA 抓真实点击的流量可以
+直接看到这个差别：
+
+```
+user-agent: ... Chrome/155.0.0.0 Safari/537.36           → 通过
+user-agent: ... HeadlessChrome/155.0.0.0 Safari/537.36   → 403 recaptcha validation failed
+```
+
+所以插件做了两件事：启动时传 `--user-agent=`，页面加载前再用
+`Emulation.setUserAgentOverride` 覆盖 `navigator.userAgentData`（只改 UA 参数的话，
+client hints 里仍会露出 headless 品牌）。
+
+> 排查提示：如果哪天又出现 `403 recaptcha validation failed`，先怀疑 UA / client hints，
+> 不要急着判定「账号被限流了」。这个误判我在开发时踩过 —— 两个不同 profile 都失败，
+> 原因是它们都是 headless。想验证：`MAGPIE_ARENA_HEADLESS=0` 跑一次，能成就是 UA 问题。
+
 
 ---
 
@@ -279,6 +299,17 @@ magpie plugin rm arena                 # 卸载
 改 `arena.mjs` 顶部的 `CHROME_CANDIDATES`，或把 `chrome` 放进 `PATH`。
 
 **CDP 端口**默认 `9793`，被占用时设环境变量 `MAGPIE_ARENA_CDP_PORT`。
+
+**无窗口运行**默认开启（`--headless=new`）。想看到浏览器在做什么，设
+`MAGPIE_ARENA_HEADLESS=0`；它也是判断“是不是 UA 问题”的最快办法。
+
+**改了代码却像是没生效**：Magpie 会把插件模块缓存在进程里，`magpie plugin on|off` 换不掉。
+要真正重载，得卸载再装：
+
+```bash
+magpie plugin rm arena && magpie plugin add github:xiaozhong132645/magpie-arena
+```
+
 
 ---
 
