@@ -664,17 +664,35 @@ export class ArenaEngine {
 
   // ---------- models ----------
   async listModels(force = false) {
+    return this.listArenaModels('text-to-image', force);
+  }
+
+  /**
+   * Read one arena's model list from arena's catalog.
+   *
+   * arena exposes several independent arenas (text, code, search, document,
+   * text-to-image, text-to-video) and they overlap heavily: the same chat model
+   * appears under text, code and document. Each arena is registered as its own
+   * Magpie provider id, so the duplicates stay separate - that keeps the
+   * capability visible in the model name (arena-text/x vs arena-code/x) instead
+   * of collapsing two different request shapes into one menu entry.
+   */
+  async listArenaModels(arenaName, force = false) {
     await this.ensure();
-    if (!force && this.models && Date.now() - this.modelsAt < 6 * 3600_000) return this.models;
+    this.modelCache = this.modelCache || new Map();
+    const hit = this.modelCache.get(arenaName);
+    if (!force && hit && Date.now() - hit.at < 6 * 3600_000) return hit.models;
+
     const r = await this.cdp.send('Runtime.evaluate', {
       expression: `fetch('/nextjs-api/model-catalog').then(r=>r.json()).then(j=>JSON.stringify(j)).catch(e=>JSON.stringify({err:String(e)}))`,
       awaitPromise: true, returnByValue: true,
     }, this.sessionId);
     const cat = JSON.parse(r.result?.value ?? '{}');
     const arr = Array.isArray(cat) ? cat : cat.arenas ?? [];
-    const arena = arr.find((a) => a.arena === 'text-to-image');
-    if (!arena) throw new Error('text-to-image arena not found in model-catalog');
-    this.models = (arena.models ?? [])
+    const arena = arr.find((a) => a.arena === arenaName);
+    if (!arena) throw new Error(`${arenaName} arena not found in model-catalog`);
+
+    const models = (arena.models ?? [])
       .filter((m) => m.userSelectable !== false)
       .map((m) => ({
         id: m.id,
@@ -682,8 +700,8 @@ export class ArenaEngine {
         displayName: m.displayName,
         organization: m.organization,
       }));
-    this.modelsAt = Date.now();
-    return this.models;
+    this.modelCache.set(arenaName, { at: Date.now(), models });
+    return models;
   }
 
   resolveModel(models, name) {
@@ -773,6 +791,133 @@ export class ArenaEngine {
       });
     }
     return j;
+  }
+
+  /**
+   * Run a chat turn against an arena text arena and return the answer.
+   *
+   * arena streams chat as one event per token on two mirrored channels (a0/b0
+   * for the two battle sides) and closes with ad/bd carrying finishReason:
+   *
+   *   a0:"1\n"   a0:"2\n"   ad:{"finishReason":"stop"}
+   *
+   * We request mode 'battle' with both model ids identical, so the two channels
+   * always carry the same text; whichever arrives first wins and the other is
+   * ignored. mode 'direct' exists too but is rejected for some arenas.
+   */
+  async chat({ messages, model, arenaName = 'text', timeoutMs = 180000 }) {
+    await this.ensure();
+    const run = async () => {
+      await this.ensureFresh().catch(() => {});
+      return this._chatOnce({ messages, model, arenaName, timeoutMs });
+    };
+    const p = this.queue.then(run, run);
+    this.queue = p.then(() => {}, () => {});
+    return p;
+  }
+
+  async _chatOnce({ messages, model, arenaName, timeoutMs }) {
+    const models = await this.listArenaModels(arenaName);
+    const target = this.resolveModel(models, model) || models[0];
+    if (!target) throw Object.assign(new Error(`no model matched "${model}" in ${arenaName} arena`), { status: 400 });
+
+    // arena takes a single user message per evaluation; fold the conversation
+    // into one prompt so a multi-turn agent request still makes sense.
+    const list = Array.isArray(messages) ? messages : [];
+    let prompt = '';
+    if (list.length === 1) {
+      prompt = String(list[0]?.content ?? '');
+    } else {
+      prompt = list
+        .map((m) => {
+          const role = String(m?.role || 'user');
+          const text = typeof m?.content === 'string'
+            ? m.content
+            : Array.isArray(m?.content)
+              ? m.content.map((p) => (typeof p === 'string' ? p : p?.text ?? '')).join('')
+              : '';
+          return `${role}: ${text}`;
+        })
+        .join('\n\n');
+    }
+
+    const expr = `(async () => {
+      const uuidv7 = () => {
+        const b = new Uint8Array(16); crypto.getRandomValues(b);
+        let ts = BigInt(Date.now());
+        for (let i = 5; i >= 0; i--) { b[i] = Number(ts & 0xffn); ts >>= 8n; }
+        b[6] = (b[6] & 0x0f) | 0x70; b[8] = (b[8] & 0x3f) | 0x80;
+        const h = [...b].map(x => x.toString(16).padStart(2,'0')).join('');
+        return h.slice(0,8)+'-'+h.slice(8,12)+'-'+h.slice(12,16)+'-'+h.slice(16,20)+'-'+h.slice(20);
+      };
+      let token = null;
+      try {
+        token = await new Promise((res, rej) => {
+          const t = setTimeout(() => rej(new Error('token timeout')), 40000);
+          window.grecaptcha.enterprise.ready(async () => {
+            try { const tk = await window.grecaptcha.enterprise.execute('${SITE_KEY}', { action: '${ACTION}' }); clearTimeout(t); res(tk); }
+            catch (e) { clearTimeout(t); rej(e); }
+          });
+        });
+      } catch (e) { return JSON.stringify({ stage: 'token', err: String(e && e.message || e) }); }
+
+      const body = {
+        id: uuidv7(), mode: 'battle',
+        modelAId: ${JSON.stringify(target.id)}, modelBId: ${JSON.stringify(target.id)},
+        userMessageId: uuidv7(), modelAMessageId: uuidv7(), modelBMessageId: uuidv7(),
+        userMessage: { content: ${JSON.stringify(prompt)}, experimental_attachments: [], metadata: {} },
+        modality: 'chat', recaptchaV3Token: token,
+      };
+      const r = await fetch('/nextjs-api/stream/create-evaluation', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
+        body: JSON.stringify(body),
+      });
+      const ct = r.headers.get('content-type') || '';
+      if (!ct.includes('event-stream')) {
+        return JSON.stringify({ stage: 'create', status: r.status, text: (await r.text()).slice(0, 400) });
+      }
+      const reader = r.body.getReader(); const dec = new TextDecoder();
+      let buf = '', text = '', finish = null; const t0 = Date.now();
+      while (Date.now() - t0 < ${Math.min(timeoutMs, 240000)}) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf(String.fromCharCode(10))) >= 0) {
+          const evt = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+          const m = /^(a0|b0|ad|bd|a2|b2):(.*)$/s.exec(evt);
+          if (!m) continue;
+          const ch = m[1], payload = m[2];
+          if (ch === 'a0') {
+            try { text += JSON.parse(payload); } catch {}
+          } else if (ch === 'ad') {
+            try { const j = JSON.parse(payload); finish = j.finishReason || null; } catch {}
+          }
+        }
+        if (finish) break;
+      }
+      try { await reader.cancel(); } catch {}
+      return JSON.stringify({ stage: 'ok', text, finishReason: finish });
+    })()`;
+
+    const out = await this.cdp.send('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true }, this.sessionId);
+    let j = null;
+    try { j = JSON.parse(out.result?.value ?? '{}'); } catch {}
+    if (!j) throw Object.assign(new Error('cannot parse arena chat response'), { status: 502 });
+    if (j.stage !== 'ok') {
+      const err = new Error(`${j.stage} failed: ${j.err || j.text || ''}`);
+      if (j.status === 429) {
+        err.status = 429;
+        err.code = 'arena_rate_limited';
+        err.message = 'arena.ai rate limited this account (429): too many requests, try again later';
+      } else {
+        err.status = 502;
+        err.code = 'arena_upstream_error';
+      }
+      throw err;
+    }
+    return { model: target.name, displayName: target.displayName, text: j.text, finishReason: j.finishReason };
   }
 
   async generate({ prompt, model, timeoutMs = 280000, referenceImages = [] }) {

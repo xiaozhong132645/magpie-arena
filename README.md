@@ -78,6 +78,22 @@ client hints 里仍会露出 headless 品牌）。
 
 ---
 
+### 也能聊天
+
+同一个 provider 同时给出 arena 的文字模型（默认全部加载）：
+
+```
+magpie <agent> arena/gemini-3-flash
+```
+
+`/v1/chat/completions` 走 arena 的 text arena，支持流式（OpenAI SSE 形状）与多轮。
+arena 一次只收一条 user message，所以多轮会被折叠成一个带角色前缀的提示词。
+
+图片模型和文字模型靠名字区分：`generate_image` 用图片模型，聊天用文字模型。
+如果把图片模型选成 agent 的聊天模型，插件会明确告诉你该换哪个。
+
+---
+
 ### 用参考图继续改
 
 `generate_image` 的 `reference_images` 接文件路径或 http(s) URL：
@@ -103,6 +119,7 @@ generate_image(
 - **不是 API 逆向。** 它不伪造请求头、不破解 reCAPTCHA，就是用你自己的账号在浏览器里
   做你手动也能做的事。
 - **不是 arena.ai 官方产品**，与 arena.ai 无关。用的是**你自己**的账号和额度。
+- **同时是文字模型供应商。** 除了生图，还接管 arena 的 text arena（113 个聊天模型：gemini-3.8-flash、claude-sonnet-5、grok-4.6、glm-5.1 等），走标准的 /v1/chat/completions。
 - **参考图编辑支持 26/40 个模型。** `/v1/images/edits` 可用，本地图片会先上传到你自己
   账号的 arena 存储再作为参考图；纯文生图的模型（`recraft-v4`、`photon`、`seedream-3` 等
   14 个）不能改图，arena 会回 400。

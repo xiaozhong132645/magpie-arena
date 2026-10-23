@@ -53,7 +53,8 @@ function cookieFromAuth(auth) {
   return raw;
 }
 
-function modelEntry(model) {
+function modelEntry(model, kind = "image") {
+  const isChat = kind === "chat";
   return {
     id: model.name,
     providerID: ID,
@@ -68,12 +69,12 @@ function modelEntry(model) {
     // model). Keeping it generous lets our explanatory error through instead.
     limit: { context: 1000000, output: 8192 },
     capabilities: {
-      temperature: false,
+      temperature: isChat,
       reasoning: false,
       attachment: false,
       toolcall: false,
       input: { text: true, image: false, audio: false, video: false, pdf: false },
-      output: { text: false, image: true, audio: false, video: false, pdf: false },
+      output: { text: isChat, image: !isChat, audio: false, video: false, pdf: false },
       interleaved: false,
     },
     variants: {},
@@ -272,18 +273,71 @@ export const ArenaPlugin = async (_input, options = {}) => {
                 return json(200, { created: Math.floor(Date.now() / 1000), data });
               }
 
-              // ---- a chat request for an image model: say exactly how to fix it ----
+              // ---- chat completions: arena text arena ----
               if (request.method === "POST" && (path === "/v1/chat/completions" || path === "/chat/completions")) {
-                throw new PluginError(
-                  400,
-                  "images_endpoint_required",
-                  "arena models draw images; they are not chat models. This request came in as a chat completion, " +
-                  "which usually means an agent was switched to an arena model by mistake. Fix: pick a text model " +
-                  "for the agent (magpie <agent> <provider>/<chat-model>), and let the agent draw by calling " +
-                  "Magpie's generate_image tool; set settings.json \"imageGen\": \"arena/<model>\" to choose which " +
-                  "arena model that tool uses. To hide arena models from the agent's model list entirely, run " +
-                  "magpie provider listed arena no.",
-                );
+                let body;
+                try { body = await request.json(); } catch { throw new PluginError(400, "invalid_json", "Expected a JSON body."); }
+                const messages = body?.messages;
+                if (!Array.isArray(messages) || !messages.length) {
+                  throw new PluginError(400, "messages_required", "messages is required");
+                }
+                const model = typeof body?.model === "string" ? body.model : undefined;
+                const stream = body?.stream === true;
+
+                // only answer when the model really is a chat model; an image
+                // model here means the caller mixed up its configuration
+                let chatModels = [];
+                try { chatModels = await engine.listArenaModels("text"); } catch { /* fall through below */ }
+                const wants = String(model || "").replace(/^arena\//, "").toLowerCase();
+                const isChat = !wants || chatModels.some((m) => (m.name || "").toLowerCase() === wants);
+                if (!isChat) {
+                  throw new PluginError(
+                    400,
+                    "images_endpoint_required",
+                    `${model} draws images; it is not a chat model. Pick a text model for the agent ` +
+                    "(magpie <agent> <provider>/<chat-model>), and let the agent draw by calling Magpie's " +
+                    "generate_image tool; set settings.json \"imageGen\" to choose which arena model that tool uses.",
+                  );
+                }
+
+                const result = await engine.chat({ messages, model });
+
+                if (!stream) {
+                  return json(200, {
+                    id: "chatcmpl-" + Date.now().toString(36),
+                    object: "chat.completion",
+                    created: Math.floor(Date.now() / 1000),
+                    model: result.model,
+                    choices: [{
+                      index: 0,
+                      message: { role: "assistant", content: result.text },
+                      finish_reason: result.finishReason === "stop" ? "stop" : "stop",
+                    }],
+                  });
+                }
+
+                // SSE in the OpenAI shape
+                const enc = new TextEncoder();
+                const mk = (obj) => enc.encode("data: " + JSON.stringify(obj) + "\n\n");
+                const idStr = "chatcmpl-" + Date.now().toString(36);
+                const created = Math.floor(Date.now() / 1000);
+                const streamBody = new ReadableStream({
+                  start(controller) {
+                    controller.enqueue(mk({
+                      id: idStr, object: "chat.completion.chunk", created, model: result.model,
+                      choices: [{ index: 0, delta: { role: "assistant", content: result.text }, finish_reason: null }],
+                    }));
+                    controller.enqueue(mk({
+                      id: idStr, object: "chat.completion.chunk", created, model: result.model,
+                      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                    }));
+                    controller.enqueue(enc.encode("data: [DONE]\n\n"));
+                    controller.close();
+                  },
+                });
+                return new Response(streamBody, {
+                  headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" },
+                });
               }
 
               throw new PluginError(404, "unsupported_request", "arena plugin does not serve " + path);
@@ -299,18 +353,35 @@ export const ArenaPlugin = async (_input, options = {}) => {
     provider: {
       id: ID,
       async models(_provider, ctx) {
+        const out = {};
         try {
           const cookie = cookieFromAuth(ctx?.auth);
           const engine = engineFor(cookie);
-          const models = await engine.listModels();
-          return Object.fromEntries(models.map((m) => [m.name, modelEntry(m)]));
+
+          // image arena: gated behind sign-in, and a 429/offline catalog must not
+          // hide the chat models, so each arena is loaded independently
+          try {
+            const imgs = await engine.listArenaModels("text-to-image");
+            for (const m of imgs) out[m.name] = modelEntry(m, "image");
+          } catch { /* keep going: chat models may still load */ }
+
+          try {
+            const chats = await engine.listArenaModels("text");
+            for (const m of chats) {
+              // an image model name would shadow a same-named chat model, so only
+              // fill names the image arena did not already claim
+              if (!out[m.name]) out[m.name] = modelEntry(m, "chat");
+            }
+          } catch { /* image-only is still a working provider */ }
+
+          if (Object.keys(out).length) return out;
         } catch {
-          // no sign-in yet (or arena unreachable): keep the placeholder so the
-          // provider is still visible and the sign-in prompt makes sense
-          return {
-            "gpt-image-2.5-sunburst": modelEntry({ name: "gpt-image-2.5-sunburst", displayName: "GPT Image 2.5 Sunburst" }),
-          };
+          // no sign-in yet (or arena unreachable): fall through to placeholders
         }
+        // keep the provider visible before the first sign-in so the prompt makes sense
+        return {
+          "gpt-image-2.5-sunburst": modelEntry({ name: "gpt-image-2.5-sunburst", displayName: "GPT Image 2.5 Sunburst" }, "image"),
+        };
       },
     },
   };
