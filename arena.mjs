@@ -809,7 +809,18 @@ export class ArenaEngine {
     await this.ensure();
     const run = async () => {
       await this.ensureFresh().catch(() => {});
-      return this._chatOnce({ messages, model, arenaName, timeoutMs });
+      // arena answers 429 when requests arrive back to back; one patient retry
+      // turns that into a slow success instead of a hard failure for the caller
+      try {
+        return await this._chatOnce({ messages, model, arenaName, timeoutMs });
+      } catch (e) {
+        if (e && e.status === 429) {
+          this.log('chat rate limited; retrying once after a pause');
+          await sleep(15000);
+          return this._chatOnce({ messages, model, arenaName, timeoutMs });
+        }
+        throw e;
+      }
     };
     const p = this.queue.then(run, run);
     this.queue = p.then(() => {}, () => {});

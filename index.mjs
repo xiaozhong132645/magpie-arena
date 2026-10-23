@@ -284,13 +284,19 @@ export const ArenaPlugin = async (_input, options = {}) => {
                 const model = typeof body?.model === "string" ? body.model : undefined;
                 const stream = body?.stream === true;
 
-                // only answer when the model really is a chat model; an image
-                // model here means the caller mixed up its configuration
-                let chatModels = [];
-                try { chatModels = await engine.listArenaModels("text"); } catch { /* fall through below */ }
+                // Reject only when the model is known to be an image model. A model
+                // missing from the chat arena is not proof of anything: arena adds
+                // and renames models constantly, and a stale catalog would otherwise
+                // turn a working chat model into a confusing "this draws images".
                 const wants = String(model || "").replace(/^arena\//, "").toLowerCase();
-                const isChat = !wants || chatModels.some((m) => (m.name || "").toLowerCase() === wants);
-                if (!isChat) {
+                let isImageOnly = false;
+                if (wants) {
+                  try {
+                    const imgs = await engine.listArenaModels("text-to-image");
+                    isImageOnly = imgs.some((m) => (m.name || "").toLowerCase() === wants);
+                  } catch { /* cannot tell: let arena decide */ }
+                }
+                if (isImageOnly) {
                   throw new PluginError(
                     400,
                     "images_endpoint_required",
